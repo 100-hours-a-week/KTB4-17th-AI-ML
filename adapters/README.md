@@ -4,6 +4,8 @@
 
 `kakaocorp/kanana-2-1.3b-instruct`에 가드레일 LoRA(SFT)를 병합한 모델 위에 애착 2축(회피·불안) DPO LoRA를 계수(α)로 합쳐 9가지 성향(3 × 3)을 만든다.
 
+> 서버 배포용 9칸(원본 Kanana 위에 바로 얹는 LoRA 1개, 가드레일 포함)은 `scripts/build_cells.py` 로 만든다. 배포 흐름은 [루트 README](../README.md).
+
 ## 구성
 
 | 폴더 | 내용 | 얹는 모델 |
@@ -29,12 +31,15 @@ base = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype="bfloat16")
 
 # 1) 가드레일 병합 (9칸 모두의 기본 모델)
 merged = PeftModel.from_pretrained(base, "adapters/guard").merge_and_unload()
-merged.save_pretrained("guard5_merged"); tok.save_pretrained("guard5_merged")
+merged.save_pretrained("guard5_merged")
+tok.save_pretrained("guard5_merged")
 
 # 2) 애착 어댑터를 α로 합쳐 칸 만들기 (예: 회피 높음 × 불안 0.75)
 m = PeftModel.from_pretrained(merged, "adapters/avoid", adapter_name="avoid")
 m.load_adapter("adapters/anxiety", adapter_name="anxiety")
-m.add_weighted_adapter(["avoid", "anxiety"], [1.0, 0.75], "high_anx0.75", combination_type="cat")
+m.add_weighted_adapter(
+    ["avoid", "anxiety"], [1.0, 0.75], "high_anx0.75", combination_type="cat"
+)
 m.set_adapter("high_anx0.75")
 ```
 
