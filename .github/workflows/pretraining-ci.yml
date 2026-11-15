@@ -78,6 +78,15 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pretraining-ci-${{ github.run_id }}-${{ github.run_attempt }}
-          path: reports/
+          path: |
+            reports/preflight/preflight.json
+            reports/preflight/preflight.junit.xml
+            reports/preflight/summary.md
+            reports/tests.junit.xml
+            reports/coverage.json
+            reports/coverage.xml
+            reports/coverage-availability.json
+            reports/finalization.json
+            reports/summary.md
           retention-days: 14
           if-no-files-found: error

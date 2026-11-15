@@ -50,7 +50,7 @@ def test_valid_counts_and_historical_provenance(tmp_path):
     adapter = result['adapters'][0]
     assert adapter['pair_count'] == 1 and adapter['layers'] == [0]
     assert adapter['rank'] == 2 and adapter['lora_alpha'] == 4
-    assert adapter['base_model_provenance'] == '/historical/merged'
+    assert adapter['base_model_provenance'] == {'kind': 'absolute_path', 'sha256': hashlib.sha256(b'/historical/merged').hexdigest()}
     assert adapter['files']['weights']['sha256'] == hashlib.sha256((directory / 'adapter_model.safetensors').read_bytes()).hexdigest()
     assert result['training_executed'] is False and result['model_downloads'] == 0 and result['gpu_used'] is False
     assert all(c['duration_seconds'] >= 0 for c in result['checks'])
@@ -244,3 +244,73 @@ def test_explicit_partial_layer_zero_is_unsupported(tmp_path):
     result = run_audit(tmp_path)
     assert result['artifact_preflight'] is False
     assert result['metrics']['checked_values'] == 0
+
+
+@pytest.mark.parametrize('which', ['config_inside', 'config_outside', 'weights_outside', 'adapter_directory', 'adapters_directory'])
+def test_rejects_symlink_inputs_without_fingerprinting_targets(tmp_path, which):
+    root = tmp_path / 'checkout'
+    directory, _ = fixture(root)
+    outside, _ = fixture(tmp_path / 'unrelated')
+    if which in ('config_inside', 'config_outside', 'weights_outside'):
+        filename = 'adapter_config.json' if which.startswith('config') else 'adapter_model.safetensors'
+        target = (directory / 'ordinary-copy.json') if which == 'config_inside' else outside / filename
+        if which == 'config_inside': target.write_bytes((directory / filename).read_bytes())
+        (directory / filename).unlink()
+        (directory / filename).symlink_to(target)
+    else:
+        import shutil
+        replaced = directory if which == 'adapter_directory' else root / 'adapters'
+        shutil.rmtree(replaced)
+        replaced.symlink_to(outside if which == 'adapter_directory' else outside.parent, target_is_directory=True)
+    result = run_audit(root)
+    assert result['artifact_preflight'] is False
+    assert result['metrics']['checked_values'] == 0
+    label = 'weights' if which == 'weights_outside' else 'config'
+    assert label not in result['adapters'][0]['files']
+    assert str(outside) not in json.dumps(result)
+
+
+def test_oversized_config_stops_dependent_hashing_and_reads(tmp_path):
+    directory, _ = fixture(tmp_path)
+    (directory / 'adapter_config.json').write_bytes(b' ' * (1024*1024+1))
+    result = run_audit(tmp_path)
+    assert result['adapters'][0]['files'] == {}
+    assert all(c['status'] == 'skipped' for c in result['checks'] if c['name'] in
+               ('guard/config_fingerprint', 'guard/weights_fingerprint', 'guard/header', 'guard/finite_payload'))
+
+
+def test_nonregular_input_directory_is_rejected_and_not_hashed(tmp_path):
+    directory, _ = fixture(tmp_path)
+    path = directory / 'adapter_config.json'
+    path.unlink(); path.mkdir()
+    result = run_audit(tmp_path)
+    assert result['artifact_preflight'] is False
+    assert result['adapters'][0]['files'] == {}
+
+
+@pytest.mark.parametrize('base,kind', [
+    ('https://user:secret@example.test/model?token=PRIVATE_TOKEN', 'uri'),
+    ('/internal/PRIVATE_TOKEN/model', 'absolute_path'), ('pasted PRIVATE_TOKEN free text', 'opaque'),
+    ('kakaocorp/kanana-2-1.3b-instruct', 'model_identifier')],
+    ids=['uri', 'absolute-path', 'free-text', 'public-model-id'])
+def test_provenance_is_redacted_to_kind_and_digest(tmp_path, base, kind):
+    directory, _ = fixture(tmp_path)
+    path = directory / 'adapter_config.json'
+    config = json.loads(path.read_text()); config['base_model_name_or_path'] = base
+    path.write_text(json.dumps(config))
+    result = run_audit(tmp_path)
+    from ci.preflight import write_reports
+    output = tmp_path / 'reports'; write_reports(result, output)
+    provenance = result['adapters'][0]['base_model_provenance']
+    assert provenance == {'kind': kind, 'sha256': hashlib.sha256(base.encode()).hexdigest()}
+    for report in output.iterdir():
+        assert 'PRIVATE_TOKEN' not in report.read_text()
+        assert base not in report.read_text()
+
+
+def test_non_utf8_provenance_is_rejected_without_crashing(tmp_path):
+    directory, _ = fixture(tmp_path)
+    path = directory / 'adapter_config.json'
+    config = json.loads(path.read_text()); config['base_model_name_or_path'] = '\ud800'
+    path.write_text(json.dumps(config))
+    assert run_audit(tmp_path)['artifact_preflight'] is False

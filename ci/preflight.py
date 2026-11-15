@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import stat
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -66,7 +67,36 @@ def strict_json(raw):
     return result
 
 
-def fingerprint(path):
+def checked_file(path, root):
+    """Reject symlinks (including parents), escapes and nonregular inputs before I/O."""
+    root = Path(root).resolve(strict=True)
+    path = Path(path).absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        raise InvalidArtifact('Artifact input is outside the checkout.') from None
+    require(relative.parts and all(part not in ('.', '..') for part in relative.parts),
+            'Artifact input is outside the intended checkout boundary.')
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        mode = current.lstat().st_mode
+        require(not stat.S_ISLNK(mode), 'Symlink artifact inputs or parent directories are forbidden.')
+        require(stat.S_ISREG(mode) if index == len(relative.parts)-1 else stat.S_ISDIR(mode),
+                'Artifact inputs must be regular files under ordinary checkout directories.')
+    require(current.resolve(strict=True).is_relative_to(root), 'Artifact input is outside the checkout.')
+    return current
+
+
+def provenance(value):
+    kind = ('absolute_path' if value.startswith('/') else
+            'uri' if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*:', value) else
+            'model_identifier' if re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', value) else 'opaque')
+    return {'kind': kind, 'sha256': hashlib.sha256(value.encode('utf-8')).hexdigest()}
+
+
+def fingerprint(path, root):
+    path = checked_file(path, root)
     digest = hashlib.sha256()
     with path.open('rb') as handle:
         while chunk := handle.read(CHUNK_BYTES):
@@ -74,7 +104,8 @@ def fingerprint(path):
     return {'bytes': path.stat().st_size, 'sha256': digest.hexdigest()}
 
 
-def validate_config(path):
+def validate_config(path, root):
+    path = checked_file(path, root)
     require(path.stat().st_size <= MAX_CONFIG_BYTES, 'Adapter config exceeds size limit.')
     config = strict_json(path.read_bytes())
     require(config.get('peft_type') == 'LORA' and config.get('task_type') == 'CAUSAL_LM',
@@ -91,6 +122,10 @@ def validate_config(path):
     require(len(targets) == len(set(targets)), 'Duplicate target module names are forbidden.')
     base = config.get('base_model_name_or_path')
     require(isinstance(base, str) and 0 < len(base) <= 4096, 'Base model provenance must be a nonempty string.')
+    try:
+        base.encode('utf-8', errors='strict')
+    except UnicodeError:
+        raise InvalidArtifact('Base provenance must be valid UTF-8 text.') from None
     for field in ('rank_pattern', 'alpha_pattern'):
         require(not config.get(field), 'Per-module rank or alpha overrides are unsupported.')
     for field in ('use_dora', 'use_qalora', 'use_rslora', 'fan_in_fan_out', 'lora_bias'):
@@ -101,7 +136,8 @@ def validate_config(path):
     return config
 
 
-def validate_header(path, config):
+def validate_header(path, config, root):
+    path = checked_file(path, root)
     size = path.stat().st_size
     require(size >= 8, 'Safetensors length prefix is truncated.')
     with path.open('rb') as handle:
@@ -167,7 +203,8 @@ def validate_header(path, config):
     return metrics, sorted(signature), sorted(ranges), 8 + length
 
 
-def scan_payload(path, ranges, payload_start):
+def scan_payload(path, ranges, payload_start, root):
+    path = checked_file(path, root)
     checked = nonfinite = 0
     with path.open('rb') as handle:
         for start, end, dtype in ranges:
@@ -226,17 +263,18 @@ def audit(root, expected_adapters=DEFAULT_ADAPTERS):
         directory = root / 'adapters' / name
         adapter = {'name': name, 'files': {}}
         report['adapters'].append(adapter)
-        config_check, config = check(name + '/config', lambda: validate_config(directory / 'adapter_config.json'))
+        config_check, config = check(name + '/config', lambda: validate_config(directory / 'adapter_config.json', root))
         if config is not None:
             adapter.update(rank=config['r'], lora_alpha=config['lora_alpha'],
-                           base_model_provenance=config['base_model_name_or_path'])
-            config_check['warnings'].append('Base model name/path is historical provenance; existence and checkpoint identity are not verified.')
+                           base_model_provenance=provenance(config['base_model_name_or_path']))
+            config_check['warnings'].append('Redacted base provenance kind/digest is historical metadata; existence and checkpoint identity are not verified.')
         for label, filename in [('config', 'adapter_config.json'), ('weights', 'adapter_model.safetensors')]:
-            entry, details = check(name + '/' + label + '_fingerprint', lambda p=directory / filename: fingerprint(p))
+            entry, details = check(name + '/' + label + '_fingerprint', lambda p=directory / filename: fingerprint(p, root),
+                                   skip='Valid adapter config is required before dependent file hashing.' if config is None else None)
             if details is not None:
                 adapter['files'][label] = details
                 entry['metrics'] = details
-        header_check, parsed = check(name + '/header', lambda: validate_header(directory / 'adapter_model.safetensors', config),
+        header_check, parsed = check(name + '/header', lambda: validate_header(directory / 'adapter_model.safetensors', config, root),
                                      skip='Valid adapter config is required.' if config is None else None)
         if parsed is None:
             check(name + '/finite_payload', skip='Valid config and complete structural header validation are required.')
@@ -245,7 +283,7 @@ def audit(root, expected_adapters=DEFAULT_ADAPTERS):
         adapter.update(metrics)
         header_check['metrics'] = metrics.copy()
         signatures.append((signature, config['r'], config['lora_alpha'], tuple(sorted(config['target_modules']))))
-        finite_check, finite = check(name + '/finite_payload', lambda: scan_payload(directory / 'adapter_model.safetensors', ranges, start))
+        finite_check, finite = check(name + '/finite_payload', lambda: scan_payload(directory / 'adapter_model.safetensors', ranges, start, root))
         if finite is not None:
             adapter.update(finite)
             finite_check['metrics'] = finite
@@ -276,7 +314,7 @@ def write_reports(report, output):
     output.mkdir(parents=True, exist_ok=True)
     (output / 'preflight.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
     checks = report['checks']
-    suite = ET.Element('testsuite', name='adapter_artifact_preflight', tests=str(len(checks)),
+    suite = ET.Element('testsuite', name='adapter_artifact_preflight', tests=str(len(checks)), errors='0',
                        failures=str(sum(c['status'] == 'failed' for c in checks)),
                        skipped=str(sum(c['status'] == 'skipped' for c in checks)),
                        time=str(sum(c['duration_seconds'] for c in checks)))
