@@ -20,7 +20,7 @@ MAX_CONFIG_BYTES = 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
 MAX_TENSORS = 100_000
 DTYPES = {'F64': (8, 'd'), 'F32': (4, 'f'), 'F16': (2, 'e'), 'BF16': (2, 'H')}
-KEY = re.compile(r'^base_model\.model\.model\.layers\.(0|[1-9][0-9]{0,4})\.(?:self_attn|mlp)\.([a-z][a-z0-9_]*)\.lora_([AB])\.weight$')
+KEY = re.compile(r'^base_model\.model\.model\.layers\.(0|[1-9][0-9]{0,4})\.(self_attn|mlp)\.([a-z][a-z0-9_]*)\.lora_([AB])\.weight$')
 DEFAULT_ADAPTERS = ('guard', 'secure', 'anxiety', 'avoid')
 READINESS = {
     'training_entrypoint': 'No reviewed training entrypoint is defined in this repository.',
@@ -96,7 +96,7 @@ def validate_config(path):
     for field in ('use_dora', 'use_qalora', 'use_rslora', 'fan_in_fan_out', 'lora_bias'):
         require(not config.get(field), 'This adapter variation is unsupported by this preflight.')
     require(config.get('bias', 'none') == 'none' and not config.get('modules_to_save') and
-            not config.get('layers_to_transform') and not config.get('layer_replication'),
+            config.get('layers_to_transform') is None and not config.get('layer_replication'),
             'Additional saved modules or partial/replicated layers are unsupported.')
     return config
 
@@ -108,7 +108,13 @@ def validate_header(path, config):
         length = struct.unpack('<Q', handle.read(8))[0]
         require(2 <= length <= MAX_HEADER_BYTES, 'Safetensors header exceeds bounded size limits.')
         require(length <= size - 8, 'Safetensors header is truncated.')
-        header = strict_json(handle.read(length))
+        raw_header = handle.read(length)
+        require(raw_header.startswith(b'{'), 'Safetensors header must begin with an object byte.')
+        try:
+            header_text = raw_header.decode('utf-8', errors='strict')
+        except UnicodeError:
+            raise InvalidArtifact('Safetensors header must use UTF-8 encoding.') from None
+        header = strict_json(header_text)
     metadata = header.pop('__metadata__', {})
     require(isinstance(metadata, dict) and all(isinstance(v, str) for v in metadata.values()),
             'Safetensors metadata must contain string values.')
@@ -120,7 +126,7 @@ def validate_header(path, config):
     for key, spec in header.items():
         match = KEY.fullmatch(key)
         require(match is not None, 'Unsupported LoRA tensor key.')
-        layer, target, side = int(match[1]), match[2], match[3]
+        layer, module, target, side = int(match[1]), match[2], match[3], match[4]
         require(layer < 65536, 'Layer index exceeds supported limit.')
         require(isinstance(spec, dict) and set(spec) == {'dtype', 'shape', 'data_offsets'},
                 'Tensor descriptor must contain dtype, shape and data offsets only.')
@@ -136,7 +142,7 @@ def validate_header(path, config):
         require(count * DTYPES[dtype][0] == end - start, 'Tensor byte size does not match dtype and shape.')
         require((shape[0] if side == 'A' else shape[1]) == config['r'], 'Tensor rank differs from adapter config.')
         require(target in config['target_modules'], 'Tensor target differs from adapter config.')
-        pair = pairs.setdefault((layer, target), {})
+        pair = pairs.setdefault((layer, module, target), {})
         require(side not in pair, 'Duplicate LoRA A/B pair side.')
         pair[side] = key
         ranges.append((start, end, dtype))
@@ -147,7 +153,8 @@ def validate_header(path, config):
     require(all(set(pair) == {'A', 'B'} for pair in pairs.values()), 'A LoRA A/B pair is missing.')
     require(layers == set(range(max(layers) + 1)), 'Layer indices must be contiguous from zero.')
     require(targets == set(config['target_modules']), 'Configured targets do not match tensor targets.')
-    require(len(pairs) == len(layers) * len(targets),
+    require(len(pairs) == len(layers) * len(targets) and
+            len({(layer, target) for layer, _, target in pairs}) == len(pairs),
             'Every layer must contain every configured target pair.')
     cursor = 0
     for start, end, _ in sorted(ranges):

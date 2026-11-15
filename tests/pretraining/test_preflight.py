@@ -93,7 +93,8 @@ def test_rejects_corrupt_tensor_before_success(tmp_path, kind):
 @pytest.mark.parametrize('raw', [b'', b'123', struct.pack('<Q', 2**63),
     struct.pack('<Q', 10) + b'{}', struct.pack('<Q', 8) + b'{"x":NaN}',
     struct.pack('<Q', 13) + b'{"x":1,"x":2}', struct.pack('<Q', 2) + b'[]',
-    struct.pack('<Q', 2) + b'{{', struct.pack('<Q', 2) + b'\xff\xff'])
+    struct.pack('<Q', 2) + b'{{', struct.pack('<Q', 2) + b'\xff\xff',
+    struct.pack('<Q', 2) + b'{\xff'])
 def test_malformed_header_is_bounded_failure(tmp_path, raw):
     directory, _ = fixture(tmp_path)
     (directory / 'adapter_model.safetensors').write_bytes(raw)
@@ -210,6 +211,36 @@ def test_sparse_layer_target_grid_fails_before_payload_scan(tmp_path):
             header[key.replace('layers.0', f'layers.{layer}').replace('q_proj', target)] = {
                 **spec, 'data_offsets': [index * 24, (index+1) * 24]}
     write_tensor(directory, header, b'\0' * 144)
+    result = run_audit(tmp_path)
+    assert result['artifact_preflight'] is False
+    assert result['metrics']['checked_values'] == 0
+
+
+def test_split_module_a_b_pair_is_rejected_before_scan(tmp_path):
+    directory, header = fixture(tmp_path)
+    key = next(k for k in header if 'lora_B' in k)
+    header[key.replace('self_attn', 'mlp')] = header.pop(key)
+    write_tensor(directory, header)
+    result = run_audit(tmp_path)
+    assert result['artifact_preflight'] is False
+    assert result['metrics']['checked_values'] == 0
+
+
+@pytest.mark.parametrize('encoding,prefix', [('utf-16', b''), ('utf-8', b' ')])
+def test_header_requires_utf8_and_initial_object_byte(tmp_path, encoding, prefix):
+    directory, header = fixture(tmp_path)
+    raw = prefix + json.dumps(header).encode(encoding)
+    (directory / 'adapter_model.safetensors').write_bytes(struct.pack('<Q', len(raw)) + raw + b'\0'*48)
+    result = run_audit(tmp_path)
+    assert result['artifact_preflight'] is False
+    assert result['metrics']['checked_values'] == 0
+
+
+def test_explicit_partial_layer_zero_is_unsupported(tmp_path):
+    directory, _ = fixture(tmp_path)
+    path = directory / 'adapter_config.json'
+    config = json.loads(path.read_text()); config['layers_to_transform'] = 0
+    path.write_text(json.dumps(config))
     result = run_audit(tmp_path)
     assert result['artifact_preflight'] is False
     assert result['metrics']['checked_values'] == 0
