@@ -66,9 +66,82 @@ def junit_evidence(path):
             require({field: count(root.get(field)) for field in FIELDS} == totals)
         require(totals['tests'] > 0)
         return {'totals': totals, 'cases': cases,
-                'passed': not (totals['failures'] or totals['errors'])}
+                'passed': not (totals['failures'] or totals['errors']) and totals['tests'] > totals['skipped']}
     except (OSError, ValueError, ET.ParseError):
         return None
+
+
+
+def measured_metrics(report, checks, passed):
+    """Reconcile aggregate counts with adapter records and their producing checks."""
+    adapters = report.get('adapters')
+    require(isinstance(adapters, list) and len(adapters) == len(ADAPTERS) and
+            all(isinstance(a, dict) and isinstance(a.get('name'), str) for a in adapters))
+    require({a['name'] for a in adapters} == set(ADAPTERS))
+    by_name = {check['name']: check for check in checks}
+    header_fields = {'tensor_count', 'parameter_count', 'pair_count', 'layers', 'targets',
+                     'dtype_tensor_counts', 'header_bytes', 'payload_bytes'}
+    finite_fields = {'checked_values', 'nonfinite_values', 'artifact_bytes_scanned'}
+    valid_headers = 0
+    for adapter in adapters:
+        name = adapter['name']
+        files = adapter.get('files')
+        require(isinstance(files, dict) and set(files) <= {'config', 'weights'})
+        for label in ('config', 'weights'):
+            check = by_name[name + '/' + label + '_fingerprint']
+            if check['status'] == 'passed':
+                details = files.get(label)
+                require(isinstance(details, dict) and set(details) == {'bytes', 'sha256'} and
+                        details == check['metrics'] and type(details['bytes']) is int and details['bytes'] > 0 and
+                        isinstance(details['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', details['sha256']) is not None)
+            else:
+                require(label not in files and check['metrics'] == {})
+        header = by_name[name + '/header']
+        if header['status'] == 'passed':
+            valid_headers += 1
+            require(set(header['metrics']) == header_fields and
+                    all(adapter.get(key) == header['metrics'][key] for key in header_fields))
+            require(all(type(adapter[key]) is int and adapter[key] > 0 for key in
+                        ('tensor_count', 'parameter_count', 'pair_count', 'header_bytes', 'payload_bytes')))
+            layers, targets, dtypes = adapter['layers'], adapter['targets'], adapter['dtype_tensor_counts']
+            require(isinstance(layers, list) and layers and all(type(n) is int for n in layers) and
+                    layers == list(range(len(layers))))
+            require(isinstance(targets, list) and targets and all(isinstance(t, str) for t in targets) and
+                    len(set(targets)) == len(targets))
+            require(adapter['pair_count'] == len(layers) * len(targets) and adapter['tensor_count'] == 2 * adapter['pair_count'])
+            require(isinstance(dtypes, dict) and dtypes and set(dtypes) <= {'F32', 'F64', 'F16', 'BF16'} and
+                    all(type(n) is int and n > 0 for n in dtypes.values()) and sum(dtypes.values()) == adapter['tensor_count'])
+            if 'weights' in files:
+                require(files['weights']['bytes'] == 8 + adapter['header_bytes'] + adapter['payload_bytes'])
+        else:
+            require(header['metrics'] == {} and not header_fields.intersection(adapter))
+        finite = by_name[name + '/finite_payload']
+        if finite['metrics']:
+            require(set(finite['metrics']) == finite_fields and
+                    all(type(adapter.get(key)) is int and adapter[key] >= 0 and
+                        adapter[key] == finite['metrics'][key] for key in finite_fields))
+            require(header['status'] == 'passed' and adapter['checked_values'] == adapter['parameter_count'] and
+                    adapter['artifact_bytes_scanned'] == adapter['payload_bytes'] and
+                    adapter['nonfinite_values'] <= adapter['checked_values'])
+            require((adapter['nonfinite_values'] == 0) == (finite['status'] == 'passed'))
+        else:
+            require(finite['status'] != 'passed' and not finite_fields.intersection(adapter))
+    summed = ('tensor_count', 'parameter_count', 'checked_values', 'nonfinite_values', 'artifact_bytes_scanned')
+    expected = {'adapter_count': len(adapters), 'valid_header_count': valid_headers,
+                'weight_bytes': sum(a['files'].get('weights', {}).get('bytes', 0) for a in adapters),
+                **{key: sum(a.get(key, 0) for a in adapters) for key in summed}}
+    metrics = report.get('metrics')
+    require(isinstance(metrics, dict) and metrics == expected and
+            all(type(n) is int and n >= 0 for n in metrics.values()))
+    if passed:
+        require(valid_headers == len(ADAPTERS) and expected['nonfinite_values'] == 0 and
+                expected['checked_values'] == expected['parameter_count'] > 0)
+
+
+def percentage(value):
+    # Compare the bounded value before any conversion to float can overflow.
+    require(type(value) in (int, float) and 0 <= value <= 100 and math.isfinite(value))
+    return value
 
 
 def artifact_evidence(path, junit):
@@ -91,10 +164,7 @@ def artifact_evidence(path, junit):
         require(report['artifact_preflight'] == measured_pass)
         if junit is not None:
             require(len(junit['cases']) == len(statuses) and dict(junit['cases']) == statuses)
-        metrics = report.get('metrics')
-        require(isinstance(metrics, dict) and all(type(value) is int and value >= 0 for value in metrics.values()))
-        require(metrics.get('adapter_count') == 4)
-        if measured_pass: require(metrics.get('valid_header_count') == 4)
+        measured_metrics(report, checks, measured_pass)
         return report
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -122,13 +192,12 @@ def coverage_evidence(output):
             require(len(arrays[0]) >= summary['covered_lines'] and len(arrays[1]) == summary['missing_lines'] and
                     len(arrays[2]) == summary['excluded_lines'] and not set(arrays[0]) & set(arrays[1]))
             ratio = 100 * summary['covered_lines'] / summary['num_statements'] if summary['num_statements'] else 100.0
-            require(type(summary.get('percent_covered')) in (int, float) and math.isclose(summary['percent_covered'], ratio, abs_tol=0.01))
+            require(math.isclose(percentage(summary.get('percent_covered')), ratio, abs_tol=0.01))
             summaries[filename] = summary
             for key in fields: totals[key] += summary[key]
         require(totals['num_statements'] > 0 and all(type(data['totals'].get(key)) is int and data['totals'][key] == totals[key] for key in fields))
-        percent = data['totals']['percent_covered']
-        require(type(percent) in (int, float) and math.isfinite(percent) and
-                math.isclose(percent, 100 * totals['covered_lines'] / totals['num_statements'], abs_tol=0.01))
+        percent = percentage(data['totals']['percent_covered'])
+        require(math.isclose(percent, 100 * totals['covered_lines'] / totals['num_statements'], abs_tol=0.01))
         xml = ET.parse(output / 'coverage.xml').getroot()
         require(xml.tag == 'coverage' and [s.text for s in xml.findall('./sources/source')] == ['ci'])
         require(count(xml.get('lines-valid')) == totals['num_statements'] and count(xml.get('lines-covered')) == totals['covered_lines'])
@@ -143,7 +212,7 @@ def coverage_evidence(output):
             require({number for number, hits in lines if not hits} == set(data['files'][filename]['missing_lines']))
         return {'status': 'available', 'source_scope': ['ci/'], 'percent_covered': percent,
                 'reason': 'Measured per-file coverage JSON/XML sources and totals agree.'}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, ET.ParseError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, ET.ParseError):
         return unavailable
 
 

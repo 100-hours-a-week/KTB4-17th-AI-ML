@@ -182,3 +182,66 @@ def test_valid_failed_fixture_junit_is_retained_and_blocks_success(tmp_path):
     assert finalize(output, **successful_outcomes()).returncode == 1
     assert path.read_bytes() == original
     assert json.loads((output / 'finalization.json').read_text())['status'] == 'failed'
+
+
+@pytest.mark.parametrize('field', ['weight_bytes', 'tensor_count', 'parameter_count', 'checked_values',
+                                  'nonfinite_values', 'artifact_bytes_scanned'])
+def test_successful_aggregate_metrics_must_match_measured_adapter_sums(tmp_path, field):
+    output = passing_evidence(tmp_path)
+    path = output / 'preflight/preflight.json'; report = json.loads(path.read_text())
+    report['metrics'][field] += 1
+    path.write_text(json.dumps(report))
+    assert finalize(output, **successful_outcomes()).returncode == 1
+    assert json.loads((output / 'finalization.json').read_text())['status'] == 'failed'
+    assert json.loads(path.read_text())['artifact_preflight'] is False
+
+
+@pytest.mark.parametrize('mutation', ['adapter_header', 'check_header', 'adapter_finite', 'check_finite',
+                                      'fingerprint', 'hidden_payload_size', 'hidden_nonfinite'])
+def test_adapter_percheck_and_successful_numerical_invariants_are_coherent(tmp_path, mutation):
+    output = passing_evidence(tmp_path)
+    path = output / 'preflight/preflight.json'; report = json.loads(path.read_text())
+    adapter = report['adapters'][0]
+    checks = {c['name']: c for c in report['checks']}
+    if mutation == 'adapter_header': adapter['tensor_count'] += 1
+    if mutation == 'check_header': checks['guard/header']['metrics']['tensor_count'] += 1
+    if mutation == 'adapter_finite': adapter['checked_values'] += 1
+    if mutation == 'check_finite': checks['guard/finite_payload']['metrics']['checked_values'] += 1
+    if mutation == 'fingerprint': checks['guard/weights_fingerprint']['metrics']['bytes'] += 1
+    if mutation == 'hidden_payload_size':
+        adapter['payload_bytes'] += 4; adapter['artifact_bytes_scanned'] += 4
+        checks['guard/header']['metrics']['payload_bytes'] += 4
+        checks['guard/finite_payload']['metrics']['artifact_bytes_scanned'] += 4
+        report['metrics']['artifact_bytes_scanned'] += 4
+    if mutation == 'hidden_nonfinite':
+        adapter['nonfinite_values'] = 1; checks['guard/finite_payload']['metrics']['nonfinite_values'] = 1
+        report['metrics']['nonfinite_values'] = 1
+    path.write_text(json.dumps(report))
+    assert finalize(output, **successful_outcomes()).returncode == 1
+    assert json.loads((output / 'finalization.json').read_text())['status'] == 'failed'
+
+
+@pytest.mark.parametrize('location', ['totals', 'file'])
+def test_huge_coverage_percentage_is_unavailable_without_suppressing_reports(tmp_path, location):
+    output = passing_evidence(tmp_path)
+    path = output / 'coverage.json'; coverage = json.loads(path.read_text())
+    summary = coverage['totals'] if location == 'totals' else coverage['files']['ci/preflight.py']['summary']
+    summary['percent_covered'] = 10**309
+    path.write_text(json.dumps(coverage))
+    result = finalize(output, **successful_outcomes())
+    assert result.returncode == 1 and 'Traceback' not in result.stderr
+    assert json.loads((output / 'coverage-availability.json').read_text())['percent_covered'] is None
+    assert json.loads((output / 'finalization.json').read_text())['status'] == 'failed'
+    assert 'Scoped coverage unavailable' in (output / 'summary.md').read_text()
+
+
+def test_all_skipped_fixture_cases_cannot_certify_execution(tmp_path):
+    output = passing_evidence(tmp_path)
+    path = output / 'tests.junit.xml'; tree = ET.parse(path); suite = tree.getroot()
+    for case in suite.findall('testcase'): ET.SubElement(case, 'skipped')
+    suite.set('skipped', suite.get('tests')); tree.write(path, encoding='unicode')
+    original = path.read_bytes()
+    assert finalize(output, **successful_outcomes()).returncode == 1
+    assert path.read_bytes() == original
+    assert json.loads((output / 'finalization.json').read_text())['status'] == 'failed'
+    assert 'tests: 3' in (output / 'summary.md').read_text()
