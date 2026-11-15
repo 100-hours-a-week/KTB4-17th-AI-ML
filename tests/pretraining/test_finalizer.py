@@ -100,3 +100,35 @@ def test_malformed_existing_reports_are_replaced_with_failure_evidence(tmp_path)
     assert json.loads((output / 'preflight/preflight.json').read_text())['measurements_available'] is False
     assert ET.parse(output / 'preflight/preflight.junit.xml').find('.//failure') is not None
     assert json.loads((output / 'coverage-availability.json').read_text())['percent_covered'] is None
+
+
+@pytest.mark.parametrize('unavailable', ['missing_junit', 'malformed_junit', 'missing_markdown'])
+def test_missing_original_artifact_evidence_cannot_finalize_as_passed(tmp_path, unavailable):
+    from ci.preflight import audit, write_reports
+    output = tmp_path / 'reports'
+    report = audit(tmp_path)
+    report['artifact_preflight'] = True  # Controlled, passing report-consumer input.
+    write_reports(report, output / 'preflight')
+    (output / 'tests.junit.xml').write_text('<testsuite tests="1" failures="0" errors="0" skipped="0"/>')
+    (output / 'coverage.json').write_text(json.dumps({'totals': {'percent_covered': 100.0}}))
+    junit = output / 'preflight/preflight.junit.xml'
+    markdown = output / 'preflight/summary.md'
+    if unavailable == 'missing_junit':
+        junit.unlink()
+    elif unavailable == 'malformed_junit':
+        junit.write_text('<broken')
+    else:
+        markdown.unlink()
+    result = finalize(output, install='success', compile='success', tests='success', audit='success')
+    assert result.returncode == 1
+    finalization = json.loads((output / 'finalization.json').read_text())
+    assert finalization['status'] == 'failed'
+    assert finalization['artifact_junit_available'] is (unavailable == 'missing_markdown')
+    assert finalization['artifact_markdown_available'] is (unavailable != 'missing_markdown')
+    assert 'CI result: **failed**' in (output / 'summary.md').read_text()
+    assert json.loads((output / 'preflight/preflight.json').read_text())['artifact_preflight'] is True
+    if unavailable != 'missing_markdown':
+        assert ET.parse(junit).find('.//failure') is not None
+    else:
+        assert 'unavailable' in markdown.read_text()
+    assert json.loads((output / 'coverage-availability.json').read_text())['percent_covered'] == 100.0

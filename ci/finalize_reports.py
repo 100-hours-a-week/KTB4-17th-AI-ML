@@ -54,10 +54,12 @@ def finalize(output, outcomes):
                               'errors': [message], 'warnings': [], 'skips': [], 'metrics': {}}],
                   'readiness_reasons': [{'code': 'validation_unavailable', 'status': 'unavailable', 'message': message}]}
         write_json(preflight / 'preflight.json', report)
-    if valid_xml(preflight / 'preflight.junit.xml') is None:
+    artifact_junit_available = valid_xml(preflight / 'preflight.junit.xml') is not None
+    artifact_markdown_available = (preflight / 'summary.md').is_file()
+    if not artifact_junit_available:
         failure_junit(preflight / 'preflight.junit.xml', 'validator_execution',
                       'Artifact JUnit unavailable; validation is not confirmed.')
-    if not (preflight / 'summary.md').exists():
+    if not artifact_markdown_available:
         (preflight / 'summary.md').write_text('# Model pre-training artifact preflight\n\n'
             'Artifact preflight: **unavailable**\nTraining ready: **false**\n\n'
             'Validator output is unavailable. No artifact measurements or passing status are inferred.\n')
@@ -77,12 +79,17 @@ def finalize(output, outcomes):
         pass
     write_json(output / 'coverage-availability.json', coverage)
     passed = (all(value == 'success' for value in outcomes.values()) and report['artifact_preflight']
+              and artifact_junit_available and artifact_markdown_available
               and fixtures_available and coverage['status'] == 'available')
     write_json(output / 'finalization.json', {'schema_version': '1.0', 'created_at_utc': created,
                'status': 'passed' if passed else 'failed', 'step_outcomes': outcomes,
+               'artifact_junit_available': artifact_junit_available,
+               'artifact_markdown_available': artifact_markdown_available,
                'fixture_results_available': fixtures_available, 'coverage': coverage})
     summary = (preflight / 'summary.md').read_text() + '\n## CI execution and report availability\n\n'
     summary += 'CI result: **' + ('passed' if passed else 'failed') + '**\n\n'
+    summary += ('Original artifact JUnit available: **' + str(artifact_junit_available).lower() + '**; '
+                'original artifact Markdown available: **' + str(artifact_markdown_available).lower() + '**.\n\n')
     summary += '\n'.join('- ' + step + ': ' + outcome for step, outcome in outcomes.items()) + '\n\n'
     if fixtures_available:
         fields = ('tests', 'failures', 'errors', 'skipped')
