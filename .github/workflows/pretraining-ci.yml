@@ -1,0 +1,94 @@
+name: Model pre-training CI
+
+on:
+  pull_request:
+    paths:
+      - 'adapters/**'
+      - 'ci/**'
+      - 'tests/pretraining/**'
+      - '.github/workflows/pretraining-ci.yml'
+      - 'docs/pretraining-ci.md'
+  push:
+    branches: [dev, 'codex/**']
+    paths:
+      - 'adapters/**'
+      - 'ci/**'
+      - 'tests/pretraining/**'
+      - '.github/workflows/pretraining-ci.yml'
+      - 'docs/pretraining-ci.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pretraining-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  artifact-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out tracked adapter artifacts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up CPU-only Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install pinned CI dependencies
+        run: python -m pip install --disable-pip-version-check -r ci/requirements.txt
+      - name: Compile validator and fixtures
+        run: python -m compileall -q ci tests/pretraining
+      - name: Test validator with scoped coverage
+        run: >-
+          python -m pytest tests/pretraining -q
+          --junitxml=reports/tests.junit.xml
+          --cov=ci --cov-config=ci/coverage.ini --cov-fail-under=95
+          --cov-report=term-missing
+          --cov-report=xml:reports/coverage.xml
+          --cov-report=json:reports/coverage.json
+      - name: Audit actual adapter artifacts
+        if: always()
+        run: python ci/preflight.py --root . --output reports/preflight
+      - name: Publish pre-training summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f reports/preflight/summary.md ]]; then
+            cat reports/preflight/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '## Preflight report unavailable' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Validation did not produce a report; inspect failed steps. This is not a passing result.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('\n## Validator fixture tests and scoped coverage\n\n')
+              junit = Path('reports/tests.junit.xml')
+              if junit.exists():
+                  suites = ET.parse(junit).getroot()
+                  fields = ('tests', 'failures', 'errors', 'skipped')
+                  totals = {key: sum(int(s.get(key, 0)) for s in suites.iter('testsuite')) for key in fields}
+                  out.write(', '.join(f'{key}: {value}' for key, value in totals.items()) + '\n\n')
+              else:
+                  out.write('Fixture JUnit unavailable; tests are not confirmed.\n\n')
+              coverage = Path('reports/coverage.json')
+              if coverage.exists():
+                  percent = json.loads(coverage.read_text())['totals']['percent_covered']
+                  out.write(f'Coverage of ci/ only: {percent:.2f}% (not training/model coverage).\n')
+              else:
+                  out.write('Scoped coverage unavailable.\n')
+          PY
+      - name: Retain sanitized diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pretraining-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/
+          retention-days: 14
+          if-no-files-found: error
