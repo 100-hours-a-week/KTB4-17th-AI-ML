@@ -245,3 +245,23 @@ def test_all_skipped_fixture_cases_cannot_certify_execution(tmp_path):
     assert path.read_bytes() == original
     assert json.loads((output / 'finalization.json').read_text())['status'] == 'failed'
     assert 'tests: 3' in (output / 'summary.md').read_text()
+
+
+def test_zero_byte_weight_preserves_genuine_failed_audit_evidence(tmp_path):
+    from ci.preflight import audit, write_reports
+    output = passing_evidence(tmp_path)
+    (tmp_path / 'checkout/adapters/guard/adapter_model.safetensors').write_bytes(b'')
+    report = audit(tmp_path / 'checkout')
+    assert report['artifact_preflight'] is False
+    checks = {check['name']: check for check in report['checks']}
+    assert checks['guard/weights_fingerprint']['status'] == 'passed'
+    assert checks['guard/weights_fingerprint']['metrics']['bytes'] == 0
+    assert checks['guard/header']['status'] == 'failed'
+    assert report['metrics']['valid_header_count'] == 3
+    write_reports(report, output / 'preflight')
+    original_json = (output / 'preflight/preflight.json').read_bytes()
+    original_junit = (output / 'preflight/preflight.junit.xml').read_bytes()
+    assert finalize(output, **{**successful_outcomes(), 'audit': 'failure'}).returncode == 1
+    assert (output / 'preflight/preflight.json').read_bytes() == original_json
+    assert (output / 'preflight/preflight.junit.xml').read_bytes() == original_junit
+    assert json.loads((output / 'finalization.json').read_text())['artifact_report_available'] is True

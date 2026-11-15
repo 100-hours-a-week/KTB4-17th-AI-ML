@@ -92,7 +92,7 @@ def measured_metrics(report, checks, passed):
             if check['status'] == 'passed':
                 details = files.get(label)
                 require(isinstance(details, dict) and set(details) == {'bytes', 'sha256'} and
-                        details == check['metrics'] and type(details['bytes']) is int and details['bytes'] > 0 and
+                        details == check['metrics'] and type(details['bytes']) is int and details['bytes'] >= 0 and
                         isinstance(details['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', details['sha256']) is not None)
             else:
                 require(label not in files and check['metrics'] == {})
